@@ -35,92 +35,109 @@ pub(crate) async fn stream_chat_completions(
     client: &reqwest::Client,
     provider: &ModelProviderInfo,
 ) -> Result<ResponseStream> {
-    // Build messages array
-    let mut messages = Vec::<serde_json::Value>::new();
-
+    // Build messages array and payload, branching for OpenAI vs other Chat providers
     let full_instructions = prompt.get_full_instructions(model);
-    messages.push(json!({"role": "system", "content": full_instructions}));
-
-    for item in &prompt.input {
-        match item {
-            ResponseItem::Message { role, content } => {
-                let mut text = String::new();
-                for c in content {
-                    match c {
-                        ContentItem::InputText { text: t }
-                        | ContentItem::OutputText { text: t } => {
-                            text.push_str(t);
-                        }
-                        _ => {}
-                    }
-                }
-                messages.push(json!({"role": role, "content": text}));
-            }
-            ResponseItem::FunctionCall {
-                name,
-                arguments,
-                call_id,
-            } => {
-                messages.push(json!({
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": arguments,
-                        }
-                    }]
-                }));
-            }
-            ResponseItem::LocalShellCall {
-                id,
-                call_id: _,
-                status,
-                action,
-            } => {
-                // Confirm with API team.
-                messages.push(json!({
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": id.clone().unwrap_or_else(|| "".to_string()),
-                        "type": "local_shell_call",
-                        "status": status,
-                        "action": action,
-                    }]
-                }));
-            }
-            ResponseItem::FunctionCallOutput { call_id, output } => {
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": output.content,
-                }));
-            }
-            ResponseItem::Reasoning { .. } | ResponseItem::Other => {
-                // Omit these items from the conversation history.
-                continue;
-            }
-        }
-    }
-
-    let tools_json = create_tools_json_for_chat_completions_api(prompt, model)?;
-    let payload = json!({
-        "model": model,
-        "messages": messages,
-        "stream": true,
-        "tools": tools_json,
-    });
-
     let base_url = provider.base_url.trim_end_matches('/');
     let url = format!("{}/chat/completions", base_url);
 
-    debug!(
-        "POST to {url}: {}",
-        serde_json::to_string_pretty(&payload).unwrap_or_default()
-    );
+    // API endpoints supporting standard OpenAI function-calling spec (functions + function_call)
+    // Only api.openai.com supports the new function-calling spec
+    let is_openai = base_url.starts_with("https://api.openai.com");
+    let tools_json = create_tools_json_for_chat_completions_api(prompt, model)?;
+    let mut messages = Vec::<serde_json::Value>::new();
+    messages.push(json!({ "role": "system", "content": full_instructions }));
+    for item in &prompt.input {
+        if !is_openai {
+            match item {
+                ResponseItem::Message { role, content } => {
+                    let mut text = String::new();
+                    for c in content {
+                        if let ContentItem::InputText { text: t } | ContentItem::OutputText { text: t } = c {
+                            text.push_str(t);
+                        }
+                    }
+                    messages.push(json!({ "role": role, "content": text }));
+                }
+                ResponseItem::FunctionCall { name, arguments, call_id } => {
+                    messages.push(json!({
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": { "name": name, "arguments": arguments }
+                        }]
+                    }));
+                }
+                ResponseItem::LocalShellCall { id, status, action, .. } => {
+                    messages.push(json!({
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": id.clone().unwrap_or_default(),
+                            "type": "local_shell_call",
+                            "status": status,
+                            "action": action
+                        }]
+                    }));
+                }
+                ResponseItem::FunctionCallOutput { call_id, output } => {
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": output.content
+                    }));
+                }
+                _ => continue,
+            }
+        } else {
+            match item {
+                ResponseItem::Message { role, content } => {
+                    let mut text = String::new();
+                    for c in content {
+                        if let ContentItem::InputText { text: t } | ContentItem::OutputText { text: t } = c {
+                            text.push_str(t);
+                        }
+                    }
+                    messages.push(json!({ "role": role, "content": text }));
+                }
+                ResponseItem::FunctionCall { name, arguments, .. } => {
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": null,
+                        "function_call": { "name": name, "arguments": arguments }
+                    }));
+                }
+                ResponseItem::FunctionCallOutput { call_id, output } => {
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": output.content
+                    }));
+                }
+                _ => continue,
+            }
+        }
+    }
+    let payload = if is_openai {
+        let functions = tools_json
+            .into_iter()
+            .filter_map(|tool| tool.get("function").cloned())
+            .collect::<Vec<_>>();
+        json!({
+            "model": model,
+            "messages": messages,
+            "functions": functions,
+            "function_call": "auto",
+            "stream": true
+        })
+    } else {
+        json!({
+            "model": model,
+            "messages": messages,
+            "stream": true,
+            "tools": tools_json
+        })
+    };
+    debug!("POST to {url}");
 
     let api_key = provider.api_key()?;
     let mut attempt = 0;
@@ -263,31 +280,44 @@ where
                 let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
             }
 
-            // Handle streaming function / tool calls.
-            if let Some(tool_calls) = choice
-                .get("delta")
-                .and_then(|d| d.get("tool_calls"))
-                .and_then(|tc| tc.as_array())
-            {
-                if let Some(tool_call) = tool_calls.first() {
-                    // Mark that we have an active function call in progress.
-                    fn_call_state.active = true;
-
-                    // Extract call_id if present.
-                    if let Some(id) = tool_call.get("id").and_then(|v| v.as_str()) {
-                        fn_call_state.call_id.get_or_insert_with(|| id.to_string());
-                    }
-
-                    // Extract function details if present.
-                    if let Some(function) = tool_call.get("function") {
-                        if let Some(name) = function.get("name").and_then(|n| n.as_str()) {
-                            fn_call_state.name.get_or_insert_with(|| name.to_string());
+            // Handle streaming function/tool calls (new 'tool_calls' or legacy 'function_call').
+            if let Some(delta) = choice.get("delta") {
+                // New OpenAI 'tool_calls' format
+                if let Some(tool_calls) = delta.get("tool_calls").and_then(|tc| tc.as_array()) {
+                    if let Some(tool_call) = tool_calls.first() {
+                        fn_call_state.active = true;
+                        // Extract call_id if present.
+                        if let Some(id) = tool_call.get("id").and_then(|v| v.as_str()) {
+                            fn_call_state.call_id.get_or_insert_with(|| id.to_string());
                         }
-
-                        if let Some(args_fragment) =
-                            function.get("arguments").and_then(|a| a.as_str())
-                        {
-                            fn_call_state.arguments.push_str(args_fragment);
+                        // Extract function details if present.
+                        if let Some(function) = tool_call.get("function") {
+                            if let Some(name) = function.get("name").and_then(|n| n.as_str()) {
+                                fn_call_state.name.get_or_insert_with(|| name.to_string());
+                            }
+                            if let Some(arg_value) = function.get("arguments") {
+                                if let Some(s) = arg_value.as_str() {
+                                    fn_call_state.arguments.push_str(s);
+                                } else {
+                                    fn_call_state.arguments.push_str(&arg_value.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                // Legacy OpenAI 'function_call' format
+                else if let Some(function_call) = delta.get("function_call") {
+                    fn_call_state.active = true;
+                    // Extract function name
+                    if let Some(name) = function_call.get("name").and_then(|n| n.as_str()) {
+                        fn_call_state.name.get_or_insert_with(|| name.to_string());
+                    }
+                    // Extract arguments, which may be a JSON string or object
+                    if let Some(arg_value) = function_call.get("arguments") {
+                        if let Some(s) = arg_value.as_str() {
+                            fn_call_state.arguments.push_str(s);
+                        } else {
+                            fn_call_state.arguments.push_str(&arg_value.to_string());
                         }
                     }
                 }
@@ -296,7 +326,8 @@ where
             // Emit end-of-turn when finish_reason signals completion.
             if let Some(finish_reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
                 match finish_reason {
-                    "tool_calls" if fn_call_state.active => {
+                    // Completion of a function/tool call (new or legacy spec)
+                    fr if fn_call_state.active && (fr == "tool_calls" || fr == "function_call") => {
                         // Build the FunctionCall response item.
                         let item = ResponseItem::FunctionCall {
                             name: fn_call_state.name.clone().unwrap_or_else(|| "".to_string()),
