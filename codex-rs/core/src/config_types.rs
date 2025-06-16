@@ -74,7 +74,7 @@ pub enum HistoryPersistence {
 }
 
 /// Collection of settings that are specific to the TUI.
-#[derive(Deserialize, Debug, Clone, PartialEq, Default)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct Tui {
     /// By default, mouse capture is enabled in the TUI so that it is possible
     /// to scroll the conversation history with a mouse. This comes at the cost
@@ -88,6 +88,11 @@ pub struct Tui {
     /// `space` still work. This allows the user to select text in the TUI
     /// using the mouse without needing to hold down a modifier key.
     pub disable_mouse_capture: bool,
+}
+impl Default for Tui {
+    fn default() -> Self {
+        Self { disable_mouse_capture: true }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Default)]

@@ -411,5 +411,5 @@ Options that are specific to the TUI.
 # mouse to support text selection. For example, even if Codex mouse capture is
 # enabled (i.e., this is set to `false`), you can still hold down alt while
 # dragging the mouse to select text.
-disable_mouse_capture = true  # defaults to `false`
+ disable_mouse_capture = true  # defaults to `true`
 ```
