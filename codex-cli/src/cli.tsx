@@ -44,6 +44,8 @@ import {
 import { createInputItem } from "./utils/input-utils";
 import { initLogger } from "./utils/logger/log";
 import { isModelSupportedForResponses } from "./utils/model-utils.js";
+// Mapping of available providers (e.g., openai, azure, gemini, etc.)
+import { providers as SUPPORTED_PROVIDERS } from "./utils/providers.js";
 import { parseToolCall } from "./utils/parsers";
 import { onExit, setInkRenderer } from "./utils/terminal";
 import chalk from "chalk";
@@ -408,6 +410,16 @@ config = {
   provider,
   disableResponseStorage,
 };
+// Detect when user has passed a provider name to --model without using --provider
+// e.g., `--model gemini` instead of `--provider gemini --model <model>`
+if (!cli.flags.provider && provider === "openai" && Object.hasOwn(SUPPORTED_PROVIDERS, config.model)) {
+  // eslint-disable-next-line no-console
+  console.error(
+    `The value "${config.model}" passed to --model appears to be a provider, not a model. ` +
+    `To use the ${config.model} provider, pass --provider ${config.model} and specify a valid model with --model.`
+  );
+  process.exit(1);
+}
 
 // Check for updates after loading config. This is important because we write state file in
 // the config dir.
